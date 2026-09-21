@@ -50,6 +50,8 @@ const els = {
   stageActive: $('#stage-active'),
   stageNick: $('#stage-nick'),
   stageTimer: $('#stage-timer'),
+  stageCountdown: $('#stage-countdown'),
+  speakDuration: $('#speak-duration'),
   btnEnd: $('#btn-end'),
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
@@ -127,6 +129,20 @@ function escapeHtml(s) {
 
 function serverNow() {
   return Date.now() + state.clockOffset;
+}
+
+// 限时时长选项：1～30 分钟（「不限时」为默认项，见 index.html）
+for (let m = 1; m <= 30; m++) {
+  const opt = document.createElement('option');
+  opt.value = String(m);
+  opt.textContent = `${m} 分钟`;
+  els.speakDuration.appendChild(opt);
+}
+
+/** 主持人当前选择的限时时长（分钟）；null 表示不限时 */
+function chosenDurationMin() {
+  const v = parseInt(els.speakDuration.value, 10);
+  return Number.isInteger(v) && v >= 1 && v <= 30 ? v : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -494,14 +510,29 @@ function renderStage(snap) {
   } else {
     els.stageIdle.classList.remove('hidden');
     els.stageActive.classList.add('hidden');
+    els.stageCountdown.classList.add('hidden');
+    els.stageCountdown.classList.remove('timer-warning');
   }
 }
 
+// 最后 30 秒醒目提示的阈值
+const COUNTDOWN_WARN_MS = 30000;
+
 function updateTimer() {
   const snap = state.snapshot;
-  if (snap && snap.speaking) {
-    const elapsed = serverNow() - snap.speaking.startedAt;
-    els.stageTimer.textContent = formatDuration(elapsed);
+  if (!snap || !snap.speaking) return;
+  const speaking = snap.speaking;
+  const elapsed = serverNow() - speaking.startedAt;
+  els.stageTimer.textContent = formatDuration(elapsed);
+  if (speaking.endsAt) {
+    // 同步倒计时：基于服务端下发的 endsAt 与 serverTs 校准后的时钟
+    const remain = Math.max(speaking.endsAt - serverNow(), 0);
+    els.stageCountdown.classList.remove('hidden');
+    els.stageCountdown.textContent = `剩余 ${formatDuration(remain)}`;
+    els.stageCountdown.classList.toggle('timer-warning', remain <= COUNTDOWN_WARN_MS);
+  } else {
+    els.stageCountdown.classList.add('hidden');
+    els.stageCountdown.classList.remove('timer-warning');
   }
 }
 
@@ -744,7 +775,10 @@ els.queueList.addEventListener('click', (e) => {
   const li = e.target.closest('.queue-item');
   const pid = li.dataset.id;
   if (btn.dataset.act === 'start') {
-    sendCmd({ type: 'start_speaking', participantId: pid });
+    const cmd = { type: 'start_speaking', participantId: pid };
+    const durationMin = chosenDurationMin();
+    if (durationMin) cmd.durationMin = durationMin;
+    sendCmd(cmd);
   } else if (btn.dataset.act === 'remove') {
     sendCmd({ type: 'remove', participantId: pid });
   } else if (btn.dataset.act === 'swap-invite') {

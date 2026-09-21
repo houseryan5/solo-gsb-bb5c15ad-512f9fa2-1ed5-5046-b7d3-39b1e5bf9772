@@ -310,6 +310,55 @@ input[type="text"]:focus {
 
 .stage-actions { margin-top: 6px; }
 
+/* ===== 限时发言倒计时 ===== */
+.stage-countdown {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: clamp(28px, 4vw, 48px);
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  padding: 2px 18px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+}
+
+/* 最后 30 秒醒目提示 */
+.stage-countdown.timer-warning {
+  color: #fff;
+  background: var(--danger);
+  border-color: #fca5a5;
+  animation: countdown-blink 1s ease-in-out infinite;
+}
+
+@keyframes countdown-blink {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+  50% { box-shadow: 0 0 0 16px rgba(239, 68, 68, 0); }
+}
+
+.duration-picker {
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+.duration-picker select {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+}
+
+.duration-picker select:focus {
+  border-color: var(--primary);
+}
+
 .pulse {
   width: 14px;
   height: 14px;

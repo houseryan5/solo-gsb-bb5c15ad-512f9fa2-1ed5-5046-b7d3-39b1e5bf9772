@@ -8,8 +8,12 @@ const WebSocket = require('ws');
 
 const TEST_PORT = process.env.TEST_PORT || '3099';
 const BASE = `http://127.0.0.1:${TEST_PORT}`;
+// 测试用：把限时发言的 1「分钟」压缩为 50ms，便于快速验证到期自动结束
+const SPEAK_TIME_UNIT_MS = 50;
 let failures = 0;
 let serverProc = null;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function test(name, fn) {
   return Promise.resolve()
@@ -141,7 +145,8 @@ async function hostCmd(host, cmd) {
   const v = host.v;
   host.lastError = null;
   host.send(Object.assign({ version: host.v }, cmd));
-  await host.waitFor((c) => c.v === v + 1 || (c.lastError && c.lastError.code === 'STALE_VERSION'));
+  await host.waitFor((c) => c.v === v + 1 || (c.lastError && c.lastError.code === 'STALE_VERSION'),
+    2000, `hostCmd ${cmd.type} v=${v}`);
 }
 
 /**
@@ -780,6 +785,146 @@ async function main() {
     await h.close(); await g1.close(); await g2b.close();
   }
 
+  // ===========================================================================
+  // 限时发言（SPEAK_TIME_UNIT_MS=50ms：协议中的 1「分钟」= 50ms）
+  // ===========================================================================
+  {
+    const created = await createRoom();
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '计时甲');
+    const g2 = await guestJoin(created.room, '计时乙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+
+    await waitStable(h, [g1, g2]);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+
+    // 22a. 非法时长：0 / 31 / 非整数 / 非数字均被拒绝且不改变版本
+    for (const bad of [0, 31, 1.5, 'abc']) {
+      const vBad = h.v;
+      h.lastError = null;
+      h.send({ type: 'start_speaking', version: h.v, participantId: id1, durationMin: bad });
+      await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_DURATION');
+      assert.strictEqual(h.v, vBad, '非法时长不得改变版本');
+    }
+
+    // 22b. 不限时：endsAt 为 null，仍下发唯一轮次标识 roundId
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    assert.ok(h.snapshot.speaking && h.snapshot.speaking.id === id1);
+    assert.strictEqual(h.snapshot.speaking.endsAt, null);
+    assert.ok(h.snapshot.speaking.roundId, '每轮发言都应下发唯一轮次标识');
+    assert.ok(h.snapshot.speaking.startedAt > 0);
+    await hostCmd(h, { type: 'end_speaking' });
+
+    // 22c. 限时开始：快照下发 startedAt / endsAt / roundId，时长换算正确并写记录
+    await hostCmd(h, { type: 'start_speaking', participantId: id1, durationMin: 30 });
+    const sp1 = h.snapshot.speaking;
+    assert.ok(sp1 && sp1.id === id1);
+    assert.strictEqual(sp1.endsAt - sp1.startedAt, 30 * SPEAK_TIME_UNIT_MS);
+    const round1 = sp1.roundId;
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'talk' && /限时 30 分钟/.test(l.text)));
+
+    // 22d. 切换发言人使旧定时任务失效：旧回调不得结束新轮次
+    await hostCmd(h, { type: 'start_speaking', participantId: id2 }); // 不限时新轮次
+    assert.strictEqual(h.snapshot.speaking.id, id2);
+    assert.strictEqual(h.snapshot.speaking.endsAt, null);
+    assert.notStrictEqual(h.snapshot.speaking.roundId, round1, '新轮次应有新的 roundId');
+    await sleep(30 * SPEAK_TIME_UNIT_MS + 400); // 远超旧轮次 endsAt
+    assert.ok(h.snapshot.speaking && h.snapshot.speaking.id === id2, '旧定时回调不得结束新轮次');
+    assert.ok(!h.snapshot.logs.some((l) => /时间到/.test(l.text)), '旧轮次不得产生到期记录');
+
+    // 22e. 手动结束使定时任务失效
+    await hostCmd(h, { type: 'end_speaking' }); // 结束 id2
+    await hostCmd(h, { type: 'start_speaking', participantId: id1, durationMin: 30 });
+    await hostCmd(h, { type: 'end_speaking' }); // 立即手动结束
+    const vAfterManualEnd = h.v;
+    await sleep(30 * SPEAK_TIME_UNIT_MS + 400);
+    assert.strictEqual(h.v, vAfterManualEnd, '手动结束后旧定时任务不得再产生版本变更');
+    assert.strictEqual(h.snapshot.speaking, null);
+
+    // 22f. 撤销开始使定时任务失效（id1 从队列中被请出发言，撤销后回到原位）
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    assert.deepStrictEqual(h.snapshot.order, [id1]);
+    await hostCmd(h, { type: 'start_speaking', participantId: id1, durationMin: 30 });
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'start_speaking');
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.speaking === null);
+    const vAfterUndoStart = h.v;
+    assert.deepStrictEqual(h.snapshot.order, [id1], '撤销开始后发言人回到原队列位置');
+    await sleep(30 * SPEAK_TIME_UNIT_MS + 400);
+    assert.strictEqual(h.v, vAfterUndoStart, '撤销开始后旧定时任务不得再产生版本变更');
+
+    // 22g. 到期自动结束：version+1、写操作记录、按普通状态变更使挂起撤销失效
+    // （start_speaking 本身会武装撤销；随后的自动结束应使其失效）
+    await hostCmd(h, { type: 'start_speaking', participantId: id1, durationMin: 1 }); // 50ms
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'start_speaking');
+    const vAuto = h.v;
+    await h.waitFor((c) => c.snapshot.speaking === null && c.v === vAuto + 1, 3000);
+    assert.ok(
+      h.snapshot.logs.some((l) => l.kind === 'talk' && /时间到，自动结束/.test(l.text)),
+      '到期自动结束应写入操作记录'
+    );
+    assert.strictEqual(h.snapshot.undo.status, 'invalid', '自动结束应使挂起撤销失效');
+    assert.strictEqual(h.snapshot.undo.reason, 'speaking_changed');
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_INVALIDATED');
+
+    // 22h. 断线重连后倒计时继续（endsAt / roundId 不变，剩余时间在轮次内）
+    await hostCmd(h, { type: 'start_speaking', participantId: id2, durationMin: 30 });
+    const sp3 = h.snapshot.speaking;
+    await g2.close(); // 发言人断线：进行中的轮次与倒计时保留
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id2);
+      return p && p.online === false;
+    });
+    assert.ok(h.snapshot.speaking && h.snapshot.speaking.id === id2, '断线不影响进行中的轮次');
+    const g2b = new Client();
+    await g2b.open();
+    g2b.send({
+      type: 'join', room: created.room, nick: '计时乙',
+      participantId: id2, secret: g2.joined.you.secret
+    });
+    await g2b.waitFor((c) => c.joined && c.joined.you.id === id2);
+    assert.ok(g2b.snapshot.speaking && g2b.snapshot.speaking.id === id2);
+    assert.strictEqual(g2b.snapshot.speaking.endsAt, sp3.endsAt, '重连后倒计时终点不变');
+    assert.strictEqual(g2b.snapshot.speaking.roundId, sp3.roundId, '重连后轮次标识不变');
+    const remain = sp3.endsAt - g2b.snapshot.serverTs;
+    assert.ok(remain > 0 && remain <= 30 * SPEAK_TIME_UNIT_MS, `重连后剩余时间应在轮次内（remain=${remain}ms）`);
+    await h.waitFor((c) => c.snapshot.speaking === null, 3000); // 该轮到期自动结束
+    await g2b.close();
+    // 等服务端处理完 g2b 的断线提交（版本稳定）后再发下一条主持人命令
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id2);
+      return p && p.online === false;
+    });
+
+    // 22i. 撤销「结束发言」恢复限时轮次：endsAt / roundId 还原，定时任务重新排程
+    await hostCmd(h, { type: 'start_speaking', participantId: id1, durationMin: 30 });
+    const sp4 = h.snapshot.speaking;
+    await hostCmd(h, { type: 'end_speaking' });
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.snapshot.speaking && c.snapshot.speaking.id === id1);
+    assert.strictEqual(h.snapshot.speaking.endsAt, sp4.endsAt, '撤销恢复限时轮次 endsAt 不变');
+    assert.strictEqual(h.snapshot.speaking.roundId, sp4.roundId, '撤销恢复限时轮次 roundId 不变');
+    await h.waitFor((c) => c.snapshot.speaking === null, 3000); // 重新排程的定时任务到点触发
+    assert.ok(h.snapshot.logs.some((l) => /时间到，自动结束/.test(l.text)));
+
+    // 22j. 一键清空使定时任务失效
+    await hostCmd(h, { type: 'start_speaking', participantId: id2, durationMin: 30 });
+    await hostCmd(h, { type: 'clear' });
+    const vAfterClear = h.v;
+    await sleep(30 * SPEAK_TIME_UNIT_MS + 400);
+    assert.strictEqual(h.v, vAfterClear, '清空后旧定时任务不得再产生版本变更');
+    assert.strictEqual(h.snapshot.speaking, null);
+
+    await h.close(); await g1.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
@@ -797,13 +942,14 @@ async function main() {
 function startServer() {
   return new Promise((resolve, reject) => {
     serverProc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-      env: { ...process.env, PORT: TEST_PORT },
+      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS) },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let settled = false;
     let output = '';
     const onData = (d) => {
       output += String(d);
+      if (process.env.SERVER_LOG) process.stderr.write(`[server] ${d}`);
       if (output.includes('已启动') && !settled) {
         settled = true;
         setTimeout(resolve, 100);

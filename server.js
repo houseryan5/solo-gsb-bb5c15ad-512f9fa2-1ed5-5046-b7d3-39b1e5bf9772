@@ -13,7 +13,7 @@
  *   { type: "swap_reject",    version, swapId }         // 被邀请方拒绝
  *   { type: "swap_cancel",    version, swapId }         // 发起方撤回
  *   { type: "leave" }
- *   { type: "start_speaking", version, participantId }  // 主持人
+ *   { type: "start_speaking", version, participantId, durationMin? }  // 主持人；durationMin 为 1~30 整数时开启限时发言
  *   { type: "end_speaking",   version }                 // 主持人
  *   { type: "reorder",        version, order:[pid...] } // 主持人
  *   { type: "remove",         version, participantId }  // 主持人
@@ -33,6 +33,13 @@
  * 四类操作会在快照 undo 字段留下结构化逆操作；之后只要发生任一版本化
  * 状态变更（version 增长），该逆操作立即标记为 invalid 并注明原因，
  * undo_host 同样经过版本守卫，冲突仍返回 STALE_VERSION + 最新快照。
+ *
+ * 限时发言：start_speaking 携带 durationMin（1~30 分钟）时，快照
+ * speaking 下发 startedAt / endsAt / roundId（唯一轮次标识），各客户端
+ * 按 serverTs 校准时钟显示同步倒计时。服务端为每轮安排定时任务，到期
+ * 自动结束本轮（version+1 并写操作记录，按普通状态变更使挂起撤销失效）。
+ * 手动结束、撤销开始、切换发言人、移出/离开/清空都会使旧定时任务失效；
+ * 回调内再校验 roundId，旧回调不会结束后续轮次。断线重连后倒计时继续。
  */
 
 'use strict';
@@ -50,6 +57,10 @@ const ROOM_TTL_MS = parseInt(process.env.ROOM_TTL_MS, 10) || 4 * 60 * 60 * 1000;
 const LOG_LIMIT = parseInt(process.env.LOG_LIMIT, 10) || 500;
 // 已结束的换位邀请（接受/拒绝/撤回/失效）在快照中保留多久，用于前端展示操作反馈
 const SWAP_RESOLVED_TTL_MS = parseInt(process.env.SWAP_RESOLVED_TTL_MS, 10) || 30000;
+// 限时发言：时长单位（默认 1 分钟）。测试可调小以快速验证到期自动结束
+const SPEAK_TIME_UNIT_MS = parseInt(process.env.SPEAK_TIME_UNIT_MS, 10) || 60000;
+const SPEAK_MIN_MINUTES = 1;
+const SPEAK_MAX_MINUTES = 30;
 
 const app = express();
 const server = http.createServer(app);
@@ -68,7 +79,9 @@ app.use(express.static(path.join(__dirname, 'public')));
  *   version,                 // 单调递增的状态版本号
  *   participants: Map<id, {id, nick, joinedAt, online, ws?}>,
  *   order: [id],             // 排队顺序
- *   speaking: { id, startedAt, elapsedMs } | null,
+ *   speaking: { id, startedAt, endsAt, roundId } | null,
+ *                            // endsAt 为 null 表示不限时；roundId 是唯一轮次标识
+ *   speakTimer,              // 当前轮次的到期定时器（Timeout | null）
  *   swaps: Map<id, {
  *     id, from, to,          // 发起人 / 目标方 participantId
  *     version, fromPos, toPos,  // 发起时的队列版本与位置（下标）
@@ -96,6 +109,7 @@ function newRoom(code) {
     participants: new Map(),
     order: [],
     speaking: null,
+    speakTimer: null,
     swaps: new Map(),
     undo: null,
     logs: [],
@@ -120,6 +134,48 @@ function genRoomCode() {
 function addLog(room, kind, text) {
   room.logs.push({ id: genId('log_'), ts: Date.now(), kind, text });
   if (room.logs.length > LOG_LIMIT) room.logs.splice(0, room.logs.length - LOG_LIMIT);
+}
+
+// ---------------------------------------------------------------------------
+// 限时发言：服务端定时任务（轮次守卫）
+// ---------------------------------------------------------------------------
+
+/** 使当前轮次的到期定时任务失效（手动结束/撤销/切换/移出/清空时调用） */
+function clearSpeakTimer(room) {
+  if (room.speakTimer) {
+    clearTimeout(room.speakTimer);
+    room.speakTimer = null;
+  }
+}
+
+/**
+ * 为当前限时发言轮次安排服务端自动结束。
+ * 回调内以 roundId 二次校验：旧轮次的回调不得结束后续轮次。
+ */
+function scheduleSpeakTimer(room) {
+  clearSpeakTimer(room);
+  const speaking = room.speaking;
+  if (!speaking || !speaking.endsAt) return;
+  const roundId = speaking.roundId;
+  const delay = Math.max(speaking.endsAt - Date.now(), 0);
+  room.speakTimer = setTimeout(() => {
+    room.speakTimer = null;
+    if (!room.speaking || room.speaking.roundId !== roundId) return; // 旧回调作废
+    autoEndSpeaking(room, roundId);
+  }, delay);
+  if (room.speakTimer.unref) room.speakTimer.unref();
+}
+
+/**
+ * 到时自动结束：与手动结束一样是一次普通版本化状态变更
+ * （version+1、广播快照、写操作记录，并使挂起的撤销失效）。
+ */
+function autoEndSpeaking(room, roundId) {
+  const speaker = room.participants.get(room.speaking.id);
+  const nick = speaker ? speaker.nick : '已离开';
+  room.speaking = null;
+  addLog(room, 'talk', `「${nick}」发言时间到，自动结束本轮（轮次 ${roundId}）`);
+  commit(room, { undoReason: 'speaking_changed' });
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +334,9 @@ function buildSnapshot(room) {
       ? {
           id: room.speaking.id,
           nick: room.participants.get(room.speaking.id)?.nick ?? '已离开',
-          startedAt: room.speaking.startedAt
+          startedAt: room.speaking.startedAt,
+          endsAt: room.speaking.endsAt ?? null,
+          roundId: room.speaking.roundId
         }
       : null,
     participants: [...room.participants.values()].map((p) => ({
@@ -589,6 +647,7 @@ function handleLeave(room, id, reason) {
   const wasSpeaking = room.speaking && room.speaking.id === id;
 
   if (wasSpeaking) {
+    clearSpeakTimer(room);
     room.speaking = null;
   }
   // 主动离开：该方参与的待处理换位邀请随之失效（断线保留，不清理）
@@ -802,10 +861,29 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (room.speaking?.id === targetId && room.order.indexOf(targetId) === -1) {
         return sendError(ws, '该成员正在发言中', 'ALREADY_SPEAKING', room);
       }
+      // 可选限时：1~30 分钟的整数；缺省表示不限时
+      let durationMin = null;
+      if (msg.durationMin !== undefined && msg.durationMin !== null) {
+        const d = Number(msg.durationMin);
+        if (!Number.isInteger(d) || d < SPEAK_MIN_MINUTES || d > SPEAK_MAX_MINUTES) {
+          return sendError(
+            ws,
+            `发言时长须为 ${SPEAK_MIN_MINUTES}～${SPEAK_MAX_MINUTES} 分钟的整数`,
+            'BAD_DURATION',
+            room
+          );
+        }
+        durationMin = d;
+      }
 
       // 逆操作：结束目标发言，必要时把其放回原队列位置，并恢复之前的发言人
       const prevSpeaking = room.speaking
-        ? { id: room.speaking.id, startedAt: room.speaking.startedAt }
+        ? {
+            id: room.speaking.id,
+            startedAt: room.speaking.startedAt,
+            endsAt: room.speaking.endsAt ?? null,
+            roundId: room.speaking.roundId
+          }
         : null;
       const idx = room.order.indexOf(targetId);
       const prevNick = prevSpeaking
@@ -830,8 +908,23 @@ function handleCommand(ws, msg, room, pid, isHost) {
         room.order.splice(idx, 1);
         invalidateSwaps(room, 'started_speaking', (s) => s.from === targetId || s.to === targetId);
       }
-      room.speaking = { id: targetId, startedAt: Date.now() };
-      addLog(room, 'talk', `主持人请「${target.nick}」开始发言`);
+      // 切换发言人：旧轮次定时任务随 room.speaking 替换一并失效
+      clearSpeakTimer(room);
+      const now = Date.now();
+      room.speaking = {
+        id: targetId,
+        startedAt: now,
+        endsAt: durationMin ? now + durationMin * SPEAK_TIME_UNIT_MS : null,
+        roundId: genId('rd_')
+      };
+      scheduleSpeakTimer(room);
+      addLog(
+        room,
+        'talk',
+        durationMin
+          ? `主持人请「${target.nick}」开始发言（限时 ${durationMin} 分钟）`
+          : `主持人请「${target.nick}」开始发言`
+      );
       return commit(room, { undoArm: true });
     }
 
@@ -840,12 +933,15 @@ function handleCommand(ws, msg, room, pid, isHost) {
       if (!room.speaking) return sendError(ws, '当前没有人发言', 'NO_SPEAKER', room);
       const speaker = room.participants.get(room.speaking.id);
       const speakerNick = speaker ? speaker.nick : '已离开';
-      // 逆操作：以原 startedAt 恢复当前发言（计时连续，不产生新的计时起点）
+      // 逆操作：以原 startedAt/endsAt/roundId 恢复当前发言（计时连续，不产生新的计时起点）
       armUndo(room, 'end_speaking', `结束「${speakerNick}」的发言`, {
         id: room.speaking.id,
         nick: speakerNick,
-        startedAt: room.speaking.startedAt
+        startedAt: room.speaking.startedAt,
+        endsAt: room.speaking.endsAt ?? null,
+        roundId: room.speaking.roundId
       });
+      clearSpeakTimer(room); // 手动结束：旧定时任务失效
       room.speaking = null;
       addLog(room, 'talk', `主持人结束「${speakerNick}」的发言`);
       return commit(room, { undoArm: true });
@@ -887,15 +983,22 @@ function handleCommand(ws, msg, room, pid, isHost) {
       const queueIndex = room.order.indexOf(targetId);
       const wasSpeaking = room.speaking?.id === targetId;
       const speakingStartedAt = wasSpeaking ? room.speaking.startedAt : null;
+      const speakingEndsAt = wasSpeaking ? room.speaking.endsAt ?? null : null;
+      const speakingRoundId = wasSpeaking ? room.speaking.roundId : null;
       armUndo(room, 'remove', `将「${target.nick}」移出队列`, {
         targetId,
         nick: target.nick,
         queueIndex,                     // -1 表示原来就不在队列
         wasSpeaking,
-        speakingStartedAt
+        speakingStartedAt,
+        speakingEndsAt,
+        speakingRoundId
       });
       if (queueIndex !== -1) room.order.splice(queueIndex, 1);
-      if (wasSpeaking) room.speaking = null;
+      if (wasSpeaking) {
+        clearSpeakTimer(room);
+        room.speaking = null;
+      }
       invalidateSwaps(room, 'removed', (s) => s.from === targetId || s.to === targetId);
       addLog(room, 'queue', `主持人将「${target.nick}」移出队列`);
       return commit(room, { undoArm: true });
@@ -908,6 +1011,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
     case 'clear': {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       room.order = [];
+      clearSpeakTimer(room);
       room.speaking = null;
       room.logs = [];
       invalidateSwaps(room, 'cleared');
@@ -977,7 +1081,13 @@ function handleUndoHost(ws, room) {
       room.order.splice(at, 0, payload.targetId);
     }
     if (payload.wasSpeaking && !room.speaking) {
-      room.speaking = { id: payload.targetId, startedAt: payload.speakingStartedAt };
+      room.speaking = {
+        id: payload.targetId,
+        startedAt: payload.speakingStartedAt,
+        endsAt: payload.speakingEndsAt ?? null,
+        roundId: payload.speakingRoundId || genId('rd_')
+      };
+      scheduleSpeakTimer(room);
     }
     if (payload.queueIndex !== -1 || payload.wasSpeaking) {
       addLog(room, 'audit', `安全撤销：已恢复「${payload.nick}」的队列位置`);
@@ -992,9 +1102,17 @@ function handleUndoHost(ws, room) {
       delete undo.payload;
       return sendError(ws, '撤销已失效：成员已离开房间', 'UNDO_INVALIDATED', room);
     }
+    // 撤销开始：当前轮次定时任务失效；若恢复原发言人则按原 endsAt 重新排程
+    clearSpeakTimer(room);
     room.speaking = payload.prevSpeaking && room.participants.has(payload.prevSpeaking.id)
-      ? { id: payload.prevSpeaking.id, startedAt: payload.prevSpeaking.startedAt }
+      ? {
+          id: payload.prevSpeaking.id,
+          startedAt: payload.prevSpeaking.startedAt,
+          endsAt: payload.prevSpeaking.endsAt ?? null,
+          roundId: payload.prevSpeaking.roundId || genId('rd_')
+        }
       : null;
+    scheduleSpeakTimer(room);
     if (payload.queueIndex !== -1 && room.order.indexOf(payload.targetId) === -1) {
       const at = Math.min(payload.queueIndex, room.order.length);
       room.order.splice(at, 0, payload.targetId);
@@ -1015,7 +1133,13 @@ function handleUndoHost(ws, room) {
       delete undo.payload;
       return sendError(ws, '撤销已失效：当前发言状态出现新的变更', 'UNDO_INVALIDATED', room);
     }
-    room.speaking = { id: payload.id, startedAt: payload.startedAt };
+    room.speaking = {
+      id: payload.id,
+      startedAt: payload.startedAt,
+      endsAt: payload.endsAt ?? null,
+      roundId: payload.roundId || genId('rd_')
+    };
+    scheduleSpeakTimer(room); // 限时轮次恢复后倒计时继续（已到期则立即自动结束）
     addLog(room, 'audit', `安全撤销：已恢复「${payload.nick}」的发言，计时连续`);
   } else {
     return sendError(ws, '未知的撤销操作', 'UNDO_NONE', room);
@@ -1049,6 +1173,7 @@ const heartbeat = setInterval(() => {
       (p) => p.ws && p.ws.readyState === OPEN
     );
     if (!anyOnline && now - room.lastSeen > ROOM_TTL_MS) {
+      clearSpeakTimer(room);
       rooms.delete(code);
     }
   }

@@ -64,6 +64,7 @@
           <div class="stage-active hidden" id="stage-active">
             <div class="stage-nick" id="stage-nick"></div>
             <div class="stage-timer" id="stage-timer">00:00</div>
+            <div class="stage-countdown hidden" id="stage-countdown"></div>
             <div class="stage-actions" id="stage-actions-host">
               <button class="btn btn-danger btn-lg" id="btn-end" type="button">结束发言</button>
             </div>
@@ -76,6 +77,12 @@
         <div class="panel-title">
           发言队列 <span class="count" id="queue-count">0</span>
           <span class="hint host-only" id="reorder-hint">（拖动调整顺序）</span>
+          <label class="duration-picker host-only" title="开始发言时的限时时长（到期自动结束）">
+            限时
+            <select id="speak-duration">
+              <option value="">不限时</option>
+            </select>
+          </label>
         </div>
         <ul class="queue-list" id="queue-list"></ul>
         <div class="queue-empty" id="queue-empty">队列为空，等待申请发言</div>
