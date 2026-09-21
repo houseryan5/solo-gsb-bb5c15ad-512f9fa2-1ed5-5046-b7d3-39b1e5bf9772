@@ -310,6 +310,47 @@ input[type="text"]:focus {
 
 .stage-actions { margin-top: 6px; }
 
+/* ===== 限时发言 ===== */
+.speak-limit-picker {
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.speak-limit-picker select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.stage-limit {
+  font-size: 16px;
+  color: var(--text-dim);
+}
+
+.stage-limit.warning {
+  color: var(--danger);
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.stage-timer.timer-warning {
+  color: var(--danger);
+  text-shadow: 0 0 28px rgba(239, 68, 68, 0.55);
+  animation: timer-blink 1s ease-in-out infinite;
+}
+
+@keyframes timer-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 .pulse {
   width: 14px;
   height: 14px;

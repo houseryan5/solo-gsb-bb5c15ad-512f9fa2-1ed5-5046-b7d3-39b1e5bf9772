@@ -27,6 +27,9 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
+// 限时发言：最后 30 秒醒目提示
+const SPEAK_WARNING_MS = 30000;
+
 // ---------------------------------------------------------------------------
 // DOM
 // ---------------------------------------------------------------------------
@@ -50,6 +53,8 @@ const els = {
   stageActive: $('#stage-active'),
   stageNick: $('#stage-nick'),
   stageTimer: $('#stage-timer'),
+  stageLimit: $('#stage-limit'),
+  speakLimitSelect: $('#speak-limit-select'),
   btnEnd: $('#btn-end'),
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
@@ -65,6 +70,14 @@ const els = {
   btnClearLogs: $('#btn-clear-logs'),
   toast: $('#toast-container')
 };
+
+// 限时发言时长选项：1～30 分钟（默认「不限时」）
+for (let m = 1; m <= 30; m++) {
+  const opt = document.createElement('option');
+  opt.value = String(m);
+  opt.textContent = `${m} 分钟`;
+  els.speakLimitSelect.appendChild(opt);
+}
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -499,9 +512,26 @@ function renderStage(snap) {
 
 function updateTimer() {
   const snap = state.snapshot;
-  if (snap && snap.speaking) {
-    const elapsed = serverNow() - snap.speaking.startedAt;
-    els.stageTimer.textContent = formatDuration(elapsed);
+  if (!snap || !snap.speaking) return;
+  const sp = snap.speaking;
+  if (sp.endsAt) {
+    // 限时发言：按服务端时间同步倒计时，最后 30 秒醒目提示
+    const remain = Math.max(0, sp.endsAt - serverNow());
+    els.stageTimer.textContent = formatDuration(Math.ceil(remain / 1000) * 1000);
+    const warning = remain <= SPEAK_WARNING_MS;
+    els.stageTimer.classList.toggle('timer-warning', warning);
+    const totalMin = Math.round((sp.endsAt - sp.startedAt) / 60000);
+    els.stageLimit.textContent = warning
+      ? `限时 ${totalMin} 分钟 · 即将到时！`
+      : `限时 ${totalMin} 分钟 · 剩余倒计时`;
+    els.stageLimit.classList.toggle('warning', warning);
+    els.stageLimit.classList.remove('hidden');
+  } else {
+    // 不限时：正计时展示已用时
+    els.stageTimer.textContent = formatDuration(serverNow() - sp.startedAt);
+    els.stageTimer.classList.remove('timer-warning');
+    els.stageLimit.classList.add('hidden');
+    els.stageLimit.classList.remove('warning');
   }
 }
 
@@ -744,7 +774,10 @@ els.queueList.addEventListener('click', (e) => {
   const li = e.target.closest('.queue-item');
   const pid = li.dataset.id;
   if (btn.dataset.act === 'start') {
-    sendCmd({ type: 'start_speaking', participantId: pid });
+    const cmd = { type: 'start_speaking', participantId: pid };
+    const mins = parseInt(els.speakLimitSelect.value, 10);
+    if (mins > 0) cmd.durationMin = mins;
+    sendCmd(cmd);
   } else if (btn.dataset.act === 'remove') {
     sendCmd({ type: 'remove', participantId: pid });
   } else if (btn.dataset.act === 'swap-invite') {
